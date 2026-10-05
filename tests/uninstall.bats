@@ -766,7 +766,7 @@ EOF
 
     local step
     for step in stop_launch_services remove_login_item; do
-        rm -f "$trace"
+        rm -f "$trace" "$fixture_home/inventory.trace"
         run env HOME="$fixture_home" PROJECT_ROOT="$PROJECT_ROOT" SIGNAL_STEP="$step" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
