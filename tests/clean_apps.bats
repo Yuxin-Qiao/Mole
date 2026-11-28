@@ -3764,7 +3764,9 @@ bundle_has_installed_app() { return 1; }
 
 tmp_dir=$(mktemp -d)
 count_file="$tmp_dir/reads"
+identity_count_file="$tmp_dir/helper-identities"
 : > "$count_file"
+: > "$identity_count_file"
 plists=()
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     plist="$tmp_dir/com.example.other$i.plist"
@@ -3774,7 +3776,8 @@ done
 # The three registrations that name the helpers sit last, the slow order.
 for name in one two three; do
     plist="$tmp_dir/com.example.helper-$name.plist"
-    /usr/libexec/PlistBuddy -c "Add :Program string /Library/PrivilegedHelperTools/com.example.$name" "$plist" > /dev/null
+    : > "$tmp_dir/helper-$name"
+    /usr/libexec/PlistBuddy -c "Add :Program string $tmp_dir/helper-$name" "$plist" > /dev/null
     plists+=("$plist")
 done
 reference_scan=false
@@ -3801,10 +3804,25 @@ clean_orphaned_system_services
 reference_scan=true
 service_cleanup_deadline=$((SECONDS + 30))
 reads() { wc -l < "$count_file" | tr -d ' '; }
+candidate_under_check=""
+fail_first_helper_lookup=false
+fixture_stat() {
+    if [[ "${*: -1}" == "$candidate_under_check" ]]; then
+        printf 'lookup\n' >> "$identity_count_file"
+        if [[ "$fail_first_helper_lookup" == "true" && ! -e "$tmp_dir/lookup-retried" ]]; then
+            # Let both stat forms fail on the first identity lookup.
+            [[ "$1" == "-L" ]] || : > "$tmp_dir/lookup-retried"
+            return 1
+        fi
+    fi
+    /usr/bin/stat "$@"
+}
+STAT_BSD=fixture_stat
 # Called directly, never in a command substitution: the memo lives in this shell.
 check() {
     r=0
-    _orphan_service_helper_is_unreferenced "/Library/PrivilegedHelperTools/com.example.$1" "$service_cleanup_deadline" || r=$?
+    candidate_under_check="$tmp_dir/helper-$1"
+    _orphan_service_helper_is_unreferenced "$candidate_under_check" "$service_cleanup_deadline" || r=$?
 }
 
 check one; [[ "$r" == "1" ]] || { echo "one: $r"; exit 1; }
@@ -3815,7 +3833,8 @@ after_three=$(reads)
 # A second pass, as before removal, over unchanged registrations.
 for name in one two three; do check "$name"; [[ "$r" == "1" ]] || { echo "again $name: $r"; exit 1; }; done
 second_pass=$(reads)
-printf 'READS first=%s three=%s again=%s\n' "$first" "$after_three" "$second_pass"
+helper_identity_checks=$(wc -l < "$identity_count_file" | tr -d ' ')
+printf 'READS first=%s three=%s again=%s helper_identities=%s\n' "$first" "$after_three" "$second_pass" "$helper_identity_checks"
 # One helper reads up to its own registration; the next two add only the two
 # registrations not yet read, and the second pass reads nothing.
 [[ "$after_three" -le $((first + 6)) ]] || { echo "later helpers re-read the inventory"; exit 1; }
@@ -3824,17 +3843,132 @@ printf 'READS first=%s three=%s again=%s\n' "$first" "$after_three" "$second_pas
 check four; [[ "$r" == "0" ]] || { echo "four: $r"; exit 1; }
 # A registration rewritten to name it has another identity and is read again.
 sleep 1
-/usr/libexec/PlistBuddy -c "Set :Program /Library/PrivilegedHelperTools/com.example.four" "${plists[0]}" > /dev/null
+/usr/libexec/PlistBuddy -c "Set :Program $tmp_dir/helper-four" "${plists[0]}" > /dev/null
 check four; [[ "$r" == "1" ]] || { echo "a rewritten registration was not re-read: $r"; exit 1; }
 # So is a new one.
 plist="$tmp_dir/com.example.new.plist"
-/usr/libexec/PlistBuddy -c "Add :Program string /Library/PrivilegedHelperTools/com.example.five" "$plist" > /dev/null
+/usr/libexec/PlistBuddy -c "Add :Program string $tmp_dir/helper-five" "$plist" > /dev/null
 plists+=("$plist")
 check five; [[ "$r" == "1" ]] || { echo "a new registration was not read: $r"; exit 1; }
+# A different path to the same binary still claims it.
+: > "$tmp_dir/helper-six"
+ln -s "$tmp_dir/helper-six" "$tmp_dir/helper-alias"
+/usr/libexec/PlistBuddy -c "Add :Program string $tmp_dir/helper-alias" "$tmp_dir/alias.plist" > /dev/null
+plists+=("$tmp_dir/alias.plist")
+check six; [[ "$r" == "1" ]] || { echo "the program's alias was not recognized: $r"; exit 1; }
+fail_first_helper_lookup=true
+check six
+[[ -f "$tmp_dir/lookup-retried" ]] || { echo "the simulated lookup did not fail"; exit 1; }
+[[ "$r" == "1" ]] || { echo "a temporary stat failure hid the program's alias: $r"; exit 1; }
+[[ "$helper_identity_checks" -eq 6 ]] || { echo "expected one helper identity query per scan"; exit 1; }
 EOF
 
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
     [[ "$output" == *"READS first="* ]] || { echo "$output"; return 1; }
+    printf '%s\n' "$output"
+}
+
+run_orphan_service_registration_recheck() {
+    run env HOME="$BATS_TEST_TMPDIR/home" PROJECT_ROOT="$PROJECT_ROOT" RECHECK_CASE="$1" \
+        MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 SYSTEM_CLEAN=true \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+debug_log() { :; }
+sudo() { return 99; }
+safe_sudo_remove() { echo "Unexpected removal" >&2; exit 99; }
+_privileged_helper_root_exists() { return 1; }
+
+fixture=$(mktemp -d)
+registration="$fixture/registration.plist"
+document="$registration"
+helper="$fixture/helper-b"
+if [[ "$RECHECK_CASE" == linked ]]; then
+    document="$fixture/linked.plist"
+    ln -s "$document" "$registration"
+fi
+
+write_registration() {
+    printf '<plist version="1.0"><dict><key>Program</key><string>%s</string></dict></plist>\n' \
+        "$fixture/helper-$1" > "$document"
+    /usr/bin/perl -MTime::HiRes=utime -e 'utime($ARGV[0], $ARGV[0], $ARGV[1]) == 1 or die $!' "$2" "$document"
+}
+
+reference_scan=false
+_mole_materialize_bounded_sudo_find() {
+    if [[ "$reference_scan" == "true" && "$3" == "/Library/LaunchDaemons" ]]; then
+        printf '%s\0' "$registration" > "$1"
+    else
+        : > "$1"
+    fi
+}
+
+_mole_bounded_sudo() {
+    shift
+    if [[ "$*" == "-n true" ]]; then return 0; fi
+    [[ "$#" -eq 5 && "$1" == -n && "$2" == /usr/libexec/PlistBuddy &&
+        "$3" == -c && "$5" == "$registration" ]] || return 99
+    local plist_rc=0
+    /usr/libexec/PlistBuddy -c "$4" "$registration" || plist_rc=$?
+    if [[ "$RECHECK_CASE" == during-read && "$4" == "Print :Program" && ! -e "$fixture/rewritten" ]]; then
+        write_registration b 1790000000.1
+        : > "$fixture/rewritten"
+    fi
+    return "$plist_rc"
+}
+
+# Load the inner helpers without discovering any deletion candidates.
+clean_orphaned_system_services
+reference_scan=true
+check_reference() {
+    reference_rc=0
+    _orphan_service_helper_is_unreferenced "$helper" "$((SECONDS + 10))" || reference_rc=$?
+}
+
+write_registration a 1790000000.1
+coarse_identity=$(/usr/bin/stat -f '%d:%i:%m:%z' "$registration")
+document_times=$(/usr/bin/stat -f '%Fm:%Fc' "$document")
+check_reference
+printf 'INITIAL=%s\n' "$reference_rc"
+if [[ "$RECHECK_CASE" == during-read ]]; then
+    [[ -f "$fixture/rewritten" ]] || exit 1
+else
+    rewrite_time=1790000000.1
+    [[ "$RECHECK_CASE" != linked ]] || rewrite_time=1790000002.2
+    write_registration b "$rewrite_time"
+fi
+[[ "$(/usr/bin/stat -f '%d:%i:%m:%z' "$registration")" == "$coarse_identity" ]] || exit 1
+if [[ "$RECHECK_CASE" != linked ]]; then
+    changed_times=$(/usr/bin/stat -f '%Fm:%Fc' "$document")
+    [[ "${changed_times%:*}" == "${document_times%:*}" && "$changed_times" != "$document_times" ]] || exit 1
+fi
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$registration")" == "$helper" ]] || exit 1
+check_reference
+printf 'RECHECK=%s\n' "$reference_rc"
+EOF
+}
+
+@test "orphan helper reference scan re-reads a registration rewritten within the same second" {
+    run_orphan_service_registration_recheck same-second
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *$'INITIAL=0\nRECHECK=1'* ]] || { echo "$output"; return 1; }
+}
+
+@test "orphan helper reference scan re-reads a linked registration when its target changes" {
+    run_orphan_service_registration_recheck linked
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *$'INITIAL=0\nRECHECK=1'* ]] || { echo "$output"; return 1; }
+}
+
+@test "orphan helper reference scan retains a helper when its registration changes during parsing" {
+    run_orphan_service_registration_recheck during-read
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *$'INITIAL=2\nRECHECK=1'* ]] || { echo "$output"; return 1; }
 }
 
 @test "_privileged_helper_bundle_id_from_binary prefers Info.plist bundle ID over directory and executable names" {

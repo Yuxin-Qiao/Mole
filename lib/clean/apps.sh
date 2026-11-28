@@ -1915,14 +1915,9 @@ clean_orphaned_system_services() {
         orphaned_count=$((orphaned_count + 1))
     }
 
-    # What each registration names as its program, remembered for this run
-    # under the plist's path and identity (device, inode, mtime, size). Every
-    # helper asks about every registration, at listing and again before
-    # removal, and each answer is two or more sudo PlistBuddy reads: three
-    # Adobe helpers on a Mac with many registrations ran the whole step to its
-    # 60 second limit and removed nothing (#2130). A registration that is new,
-    # replaced or rewritten has another identity and is read again, so the
-    # scan still sees every change; only conclusive answers are remembered.
+    # Every helper asks about every registration at preview and removal.
+    # Re-reading each unchanged plist repeatedly exhausted the section's
+    # 60-second budget (#2130), so memoize conclusive, stable reads per run.
     _ORPHAN_REFERENCE_MEMO_KEYS=()
     _ORPHAN_REFERENCE_MEMO_VALUES=()
 
@@ -1935,6 +1930,11 @@ clean_orphaned_system_services() {
         local deadline="$2"
         local service_cleanup_deadline="$deadline"
         local reference_scan_file=""
+        local helper_identity=""
+        # A same-size rewrite can keep the same whole-second mtime. A
+        # symlink's metadata does not describe what PlistBuddy reads.
+        local registration_stat_format='%d:%i:%Fm:%Fc:%z:%HT'
+        local regular_registration_identity='^[0-9]+:[0-9]+:-?[0-9]+\.[0-9]{9}:-?[0-9]+\.[0-9]{9}:[0-9]+:Regular File$'
 
         if ! reference_scan_file=$(create_temp_file 2> /dev/null); then
             return 2
@@ -1975,8 +1975,10 @@ clean_orphaned_system_services() {
                 local referenced_binary=""
                 local binary_rc=0
                 local memo_key="" memo_identity="" memo_index=0 memo_hit=false
-                memo_identity=$(/usr/bin/stat -f '%d:%i:%m:%z' "$plist" 2> /dev/null) || memo_identity=""
-                if [[ -n "$memo_identity" ]]; then
+                memo_identity=$(LC_ALL=C "$STAT_BSD" -f "$registration_stat_format" "$plist" 2> /dev/null) || memo_identity=""
+                # Only reuse a regular file with a subsecond change time.
+                if [[ "$memo_identity" =~ $regular_registration_identity &&
+                    ! "$memo_identity" =~ \.000000000:[0-9]+:Regular\ File$ ]]; then
                     memo_key="$plist|$memo_identity"
                     for ((memo_index = 0; memo_index < ${#_ORPHAN_REFERENCE_MEMO_KEYS[@]}; memo_index++)); do
                         if [[ "${_ORPHAN_REFERENCE_MEMO_KEYS[memo_index]}" == "$memo_key" ]]; then
@@ -1987,7 +1989,6 @@ clean_orphaned_system_services() {
                     done
                 fi
                 if [[ "$memo_hit" == "true" ]]; then
-                    # Remembered as naming no absolute program.
                     [[ -n "$referenced_binary" ]] || continue
                 else
                     referenced_binary=$(_plist_binary_path "$plist") || binary_rc=$?
@@ -1997,10 +1998,8 @@ clean_orphaned_system_services() {
                     break
                 fi
                 if [[ $binary_rc -ne 0 ]]; then
-                    # Distinguish a valid plist with no absolute Program from a
-                    # read failure. Re-read the key after proving the document
-                    # parses so a transient failed probe cannot become absence
-                    # evidence. Any still-inconclusive document keeps helpers.
+                    # A readable plist can lack an absolute program. Retry
+                    # the keys after proving the document can be read.
                     local readable_rc=0
                     _plist_document_is_readable "$plist" || readable_rc=$?
                     if mole_rc_timeout_or_signal "$readable_rc"; then
@@ -2019,24 +2018,30 @@ clean_orphaned_system_services() {
                     elif [[ $binary_rc -ne 0 && $binary_rc -ne 1 ]]; then
                         reference_scan_rc=2
                         break
-                    elif [[ $binary_rc -eq 1 ]]; then
-                        if [[ -n "$memo_key" ]]; then
-                            _ORPHAN_REFERENCE_MEMO_KEYS+=("$memo_key")
-                            _ORPHAN_REFERENCE_MEMO_VALUES+=("")
-                        fi
-                        continue
                     fi
                 fi
-                if [[ "$memo_hit" != "true" && -n "$memo_key" && -n "$referenced_binary" ]]; then
+                if [[ "$memo_hit" != "true" && -n "$memo_key" ]]; then
+                    local confirmed_identity=""
+                    confirmed_identity=$(LC_ALL=C "$STAT_BSD" -f "$registration_stat_format" "$plist" 2> /dev/null) || confirmed_identity=""
+                    if [[ "$confirmed_identity" != "$memo_identity" ]]; then
+                        reference_scan_rc=2
+                        break
+                    fi
                     _ORPHAN_REFERENCE_MEMO_KEYS+=("$memo_key")
                     _ORPHAN_REFERENCE_MEMO_VALUES+=("$referenced_binary")
                 fi
 
-                if [[ "$referenced_binary" == "$helper" ]] ||
-                    [[ "$(mole_path_identity "$referenced_binary")" == "$(mole_path_identity "$helper")" ]]; then
-                    reference_scan_rc=1
-                    break
+                [[ -n "$referenced_binary" ]] || continue
+                if [[ "$referenced_binary" != "$helper" ]]; then
+                    # Share a confirmed inode within this scan. Retry a path
+                    # fallback so a later alias can still match the helper.
+                    if [[ "$helper_identity" != inode:* ]]; then
+                        helper_identity=$(mole_path_identity "$helper")
+                    fi
+                    [[ "$(mole_path_identity "$referenced_binary")" == "$helper_identity" ]] || continue
                 fi
+                reference_scan_rc=1
+                break
             done < "$reference_scan_file"
 
             [[ $reference_scan_rc -eq 0 ]] || break
