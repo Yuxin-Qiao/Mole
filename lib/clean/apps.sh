@@ -1570,61 +1570,75 @@ clean_orphaned_system_services() {
         return 1
     }
 
-    # Read a launchd program path from a system plist.
-    # The plist itself was discovered with sudo, so read it with sudo too (the
-    # caller already cleared a `sudo -n true` probe, so keep it non-interactive):
-    # unreadable root-owned plists make PlistBuddy print a non-path "File Doesn't
-    # Exist, Will Create..." message on stdout, which must never be treated as a
-    # missing binary path.
-    _plist_program_value() {
+    # Resolve the executable from one read of the system registration.
+    # Status 1 means a readable dictionary without an executable field.
+    # Status 2 means the registration or its executable is not understood.
+    _plist_binary_path() {
         local plist="$1"
-        local key="$2"
-        local value=""
+        local xml=""
         local plist_probe_rc=0
         local plist_probe_timeout=""
         plist_probe_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" \
             "$service_cleanup_deadline") || plist_probe_rc=$?
         if [[ $plist_probe_rc -eq 0 ]]; then
-            value=$(_mole_bounded_sudo "$plist_probe_timeout" \
-                -n /usr/libexec/PlistBuddy -c "Print :$key" "$plist" < /dev/null 2> /dev/null) || plist_probe_rc=$?
+            xml=$(_mole_bounded_sudo "$plist_probe_timeout" \
+                -n /usr/libexec/PlistBuddy -x -c "Print" "$plist" < /dev/null 2> /dev/null) || plist_probe_rc=$?
         fi
-
         if mole_rc_timeout_or_signal "$plist_probe_rc"; then
             return "$plist_probe_rc"
         fi
-        [[ $plist_probe_rc -eq 0 ]] || return 1
+        [[ $plist_probe_rc -eq 0 && "$xml" == '<?xml '* ]] || return 2
 
-        [[ -z "$value" ]] && return 1
-        [[ "$value" != /* ]] && return 1
+        # launchd uses Program when present, even when argv[0] is different.
+        # Inspect only root keys in the normalized XML. A present field of
+        # the wrong type is unknown and cannot authorize the fallback.
+        local key=""
+        key=$(LC_ALL=C /usr/bin/awk '
+            {
+                sub(/^[[:space:]]+/, "")
+                if (depth == 0 && ($0 == "<dict>" || $0 == "<dict/>")) dictionary = 1
+                if ($0 == "<dict>" || $0 == "<array>") { ++depth; next }
+                if ($0 == "</dict>" || $0 == "</array>") { --depth; next }
+                if (depth != 1) next
+                if ($0 == "<key>Program</key>") program = 1
+                if ($0 == "<key>BundleProgram</key>") bundle = 1
+                if ($0 == "<key>ProgramArguments</key>") arguments = 1
+            }
+            END {
+                if (!dictionary || depth != 0) exit 2
+                if (program) print "Program"
+                else if (bundle) exit 2
+                else if (arguments) print "ProgramArguments.0"
+                else exit 1
+            }
+        ' <<< "$xml") || return $?
 
-        printf '%s\n' "$value"
-    }
-
-    # Read the program binary from a plist (Program or ProgramArguments[0]).
-    # Prints the path; returns 1 if no usable absolute Program key found.
-    _plist_binary_path() {
-        local plist="$1"
-        local binary=""
-        local binary_probe_rc=0
-        binary=$(_plist_program_value "$plist" "ProgramArguments:0") || binary_probe_rc=$?
-        if mole_rc_timeout_or_signal "$binary_probe_rc"; then
-            return "$binary_probe_rc"
-        fi
-        if [[ -z "$binary" ]]; then
-            binary_probe_rc=0
-            binary=$(_plist_program_value "$plist" "Program") || binary_probe_rc=$?
-            if mole_rc_timeout_or_signal "$binary_probe_rc"; then
-                return "$binary_probe_rc"
+        if [[ "$key" == "ProgramArguments.0" ]]; then
+            /usr/bin/plutil -type ProgramArguments -expect array -- - \
+                <<< "$xml" > /dev/null 2>&1 || plist_probe_rc=$?
+            if mole_rc_timeout_or_signal "$plist_probe_rc"; then
+                return "$plist_probe_rc"
             fi
+            [[ $plist_probe_rc -eq 0 ]] || return 2
         fi
-        [[ -z "$binary" ]] && return 1
+        local binary=""
+        # Keep an actual trailing newline in the value so the control-byte
+        # check sees the original string rather than a trimmed path.
+        binary=$({
+            /usr/bin/plutil -extract "$key" raw -expect string -n -o - -- - 2> /dev/null &&
+                printf '.'
+        } <<< "$xml") || plist_probe_rc=$?
+        if mole_rc_timeout_or_signal "$plist_probe_rc"; then
+            return "$plist_probe_rc"
+        fi
+        [[ $plist_probe_rc -eq 0 ]] || return 2
+        binary=${binary%.}
+        [[ "$binary" == /* && ! "$binary" =~ [[:cntrl:]] ]] || return 2
         printf '%s\n' "$binary"
     }
 
-    # Confirm that a plist can be parsed at all. `_plist_binary_path` returns 1
-    # both for a valid plist with no usable Program key and for an ordinary
-    # PlistBuddy read failure, which is sufficient for discovery but not for a
-    # sink-time proof that no registration references a helper.
+    # Confirm an inconclusive registration can be opened before re-reading
+    # it in the helper reference scan.
     _plist_document_is_readable() {
         local plist="$1"
         local plist_probe_timeout=""

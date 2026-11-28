@@ -2468,6 +2468,8 @@ cat > "$tmp_plist" <<PLIST
 </dict>
 </plist>
 PLIST
+plist_snapshot=$(/usr/libexec/PlistBuddy -x -c "Print" "$tmp_plist")
+plist_probe_log="$tmp_dir/privileged-read"
 chmod 000 "$tmp_plist"
 
 sudo() {
@@ -2483,21 +2485,91 @@ sudo() {
     return 0
   fi
   if [[ "$1" == "/usr/libexec/PlistBuddy" ]]; then
-    case "$3" in
-      "Print :ProgramArguments:0") return 1 ;;
-      "Print :Program") printf '%s\n' "$tmp_binary"; return 0 ;;
-    esac
-    return 1
+    [[ "$2" == "-x" && "$3" == "-c" && "$4" == "Print" && "$5" == "$tmp_plist" ]] || return 99
+    printf 'read\n' > "$plist_probe_log"
+    printf '%s\n' "$plist_snapshot"
+    return 0
   fi
   command "$@"
 }
 
 clean_orphaned_system_services
+[[ -s "$plist_probe_log" ]] || exit 1
 EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" != *"Found 1 orphaned"* ]] || return 1
     [[ "$output" != *"Would remove orphaned service"* ]] || return 1
+}
+
+@test "orphan service program lookup honors Program and falls back only when it is absent" {
+    run env HOME="$BATS_TEST_TMPDIR/home" PROJECT_ROOT="$PROJECT_ROOT" \
+        MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 SYSTEM_CLEAN=true \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/apps.sh"
+
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+debug_log() { :; }
+_privileged_helper_root_exists() { return 1; }
+_mole_materialize_bounded_sudo_find() { : > "$1"; }
+safe_sudo_remove() { echo "Unexpected removal" >&2; exit 99; }
+fixture=$(mktemp -d)
+sudo() {
+    [[ "$1" == "-n" ]] || return 99
+    shift
+    case "$1" in
+        true) return 0 ;;
+        /usr/libexec/PlistBuddy)
+            case "$*" in *"$fixture/"*) command "$@" ;; *) return 99 ;; esac
+            ;;
+        *) return 99 ;;
+    esac
+}
+
+python3 - "$fixture" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+arguments = ["/fixture/argument"]
+fixtures = {
+    "both": {"Program": "/fixture/with space & text", "ProgramArguments": arguments},
+    "only-arguments": {"ProgramArguments": arguments},
+    "nested": {"EnvironmentVariables": {"Program": "/fixture/nested"}, "ProgramArguments": arguments},
+    "invalid": {"Program": "", "ProgramArguments": arguments},
+    "wrong-type": {"Program": b"/fixture/data", "ProgramArguments": arguments},
+    "wrong-arguments": {"ProgramArguments": {"0": "/fixture/argument"}},
+    "control": {"Program": "/fixture/with-newline\n", "ProgramArguments": arguments},
+    "bundle": {"BundleProgram": "Contents/MacOS/example", "ProgramArguments": arguments},
+}
+for name, document in fixtures.items():
+    (root / (name + ".plist")).write_bytes(plistlib.dumps(document, fmt=plistlib.FMT_BINARY))
+(root / "unreadable.plist").write_text("not a property list")
+PY
+
+# Load the probe through the real production owner with an empty inventory.
+clean_orphaned_system_services
+service_cleanup_deadline=$((SECONDS + 15))
+for name in both only-arguments nested invalid wrong-type wrong-arguments control bundle unreadable; do
+    rc=0
+    result=$(_plist_binary_path "$fixture/$name.plist") || rc=$?
+    printf '%s=[%s:%s]\n' "$name" "$rc" "$result"
+done
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"both=[0:/fixture/with space & text]"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"only-arguments=[0:/fixture/argument]"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"nested=[0:/fixture/argument]"* ]] || { echo "$output"; return 1; }
+    local name
+    for name in invalid wrong-type wrong-arguments control bundle unreadable; do
+        [[ "$output" == *"$name=[2:]"* ]] || { echo "$output"; return 1; }
+    done
 }
 
 @test "clean_orphaned_system_services keeps earlier candidates when a later privileged inventory times out" {
@@ -2543,13 +2615,8 @@ sudo() {
         true) return 0 ;;
         test) return 1 ;;
         /usr/libexec/PlistBuddy)
-            case "${3:-}" in
-                "Print :ProgramArguments:0") return 1 ;;
-                "Print :Program")
-                    printf 'CANDIDATE_PROBED\n' >> "$candidate_trace"
-                    printf '%s\n' "$tmp_dir/missing"
-                    ;;
-            esac
+            printf 'CANDIDATE_PROBED\n' >> "$candidate_trace"
+            command "$@"
             ;;
         */stat)
             printf 'IDENTITY_CAPTURED\n' >> "$candidate_trace"
@@ -2652,7 +2719,7 @@ bundle_has_installed_app() { return 130; }
 
 tmp_dir=$(mktemp -d)
 tmp_plist="$tmp_dir/com.example.helper.plist"
-touch "$tmp_plist"
+/usr/libexec/PlistBuddy -c "Add :Program string /Library/PrivilegedHelperTools/com.example.helper" "$tmp_plist" > /dev/null
 _mole_materialize_bounded_sudo_find() {
     if [[ "$3" == "/Library/LaunchDaemons" ]]; then
         printf '%s\0' "$tmp_plist" > "$1"
@@ -2665,12 +2732,7 @@ sudo() {
     case "${1:-}" in
         true) return 0 ;;
         test) return 0 ;;
-        /usr/libexec/PlistBuddy)
-            case "${3:-}" in
-                "Print :ProgramArguments:0") return 1 ;;
-                "Print :Program") printf '/Library/PrivilegedHelperTools/com.example.helper\n' ;;
-            esac
-            ;;
+        /usr/libexec/PlistBuddy) command "$@" ;;
         /usr/bin/stat) command "$@" ;;
         *) return 0 ;;
     esac
@@ -2732,7 +2794,7 @@ else
 fi
 
 tmp_plist="$tmp_dir/$bundle_id.plist"
-touch "$tmp_plist"
+/usr/libexec/PlistBuddy -c "Add :Program string $tmp_dir/missing" "$tmp_plist" > /dev/null
 _mole_materialize_bounded_sudo_find() {
     if [[ "$3" == "/Library/LaunchDaemons" ]]; then
         printf '%s\0' "$tmp_plist" > "$1"
@@ -2745,12 +2807,7 @@ sudo() {
     case "${1:-}" in
         true) return 0 ;;
         test) return 1 ;;
-        /usr/libexec/PlistBuddy)
-            case "${3:-}" in
-                "Print :ProgramArguments:0") return 1 ;;
-                "Print :Program") printf '%s\n' "$tmp_dir/missing" ;;
-            esac
-            ;;
+        /usr/libexec/PlistBuddy) command "$@" ;;
         *) return 0 ;;
     esac
 }
@@ -2789,7 +2846,7 @@ should_protect_path() { return 1; }
 
 tmp_dir=$(mktemp -d)
 tmp_plist="$tmp_dir/com.example.refused-removal.plist"
-touch "$tmp_plist"
+/usr/libexec/PlistBuddy -c "Add :Program string $tmp_dir/missing" "$tmp_plist" > /dev/null
 _mole_materialize_bounded_sudo_find() {
     if [[ "$3" == "/Library/LaunchDaemons" ]]; then
         printf '%s\0' "$tmp_plist" > "$1"
@@ -2802,12 +2859,7 @@ sudo() {
     case "${1:-}" in
         true) return 0 ;;
         test) return 1 ;;
-        /usr/libexec/PlistBuddy)
-            case "${3:-}" in
-                "Print :ProgramArguments:0") return 1 ;;
-                "Print :Program") printf '%s\n' "$tmp_dir/missing" ;;
-            esac
-            ;;
+        /usr/libexec/PlistBuddy) command "$@" ;;
         /usr/bin/stat) command "$@" ;;
         du) printf '4\n' ;;
         launchctl)
@@ -2851,7 +2903,8 @@ tmp_dir=$(mktemp -d)
 tmp_plist="$tmp_dir/com.example.replaced.plist"
 replacement="$tmp_dir/replacement.plist"
 marker="$tmp_dir/identity-recorded"
-touch "$tmp_plist" "$replacement"
+touch "$replacement"
+/usr/libexec/PlistBuddy -c "Add :Program string $tmp_dir/missing" "$tmp_plist" > /dev/null
 _mole_materialize_bounded_sudo_find() {
     if [[ "$3" == "/Library/LaunchDaemons" ]]; then
         printf '%s\0' "$tmp_plist" > "$1"
@@ -2864,12 +2917,7 @@ sudo() {
     case "${1:-}" in
         true) return 0 ;;
         test) return 1 ;;
-        /usr/libexec/PlistBuddy)
-            case "${3:-}" in
-                "Print :ProgramArguments:0") return 1 ;;
-                "Print :Program") printf '%s\n' "$tmp_dir/missing" ;;
-            esac
-            ;;
+        /usr/libexec/PlistBuddy) command "$@" ;;
         /usr/bin/stat) command "$@" ;;
         du)
             if [[ ! -e "$marker" ]]; then
@@ -2916,7 +2964,8 @@ debug_log() { printf '%s\n' "$*"; }
 tmp_dir=$(mktemp -d)
 tmp_plist="$tmp_dir/com.example.sink-race.plist"
 replacement="$tmp_dir/replacement.plist"
-touch "$tmp_plist" "$replacement"
+touch "$replacement"
+/usr/libexec/PlistBuddy -c "Add :Program string $tmp_dir/missing" "$tmp_plist" > /dev/null
 _mole_materialize_bounded_sudo_find() {
     if [[ "$3" == "/Library/LaunchDaemons" ]]; then
         printf '%s\0' "$tmp_plist" > "$1"
@@ -2929,12 +2978,7 @@ sudo() {
     case "${1:-}" in
         true) return 0 ;;
         test) return 1 ;;
-        /usr/libexec/PlistBuddy)
-            case "${3:-}" in
-                "Print :ProgramArguments:0") return 1 ;;
-                "Print :Program") printf '%s\n' "$tmp_dir/missing" ;;
-            esac
-            ;;
+        /usr/libexec/PlistBuddy) command "$@" ;;
         /usr/bin/stat) command "$@" ;;
         du) printf '4\n' ;;
         launchctl) printf 'UNEXPECTED_LAUNCHCTL\n'; return 99 ;;
